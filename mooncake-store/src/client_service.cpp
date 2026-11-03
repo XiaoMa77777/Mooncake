@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "offload_recovery.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -50,6 +51,20 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
+
+namespace {
+std::mutex offload_epochs_mutex;
+std::unordered_map<const Client*, std::shared_ptr<detail::OffloadEpoch>>
+    offload_epochs;
+}  // namespace
+
+std::shared_ptr<detail::OffloadEpoch> detail::GetClientOffloadEpoch(
+    const Client* client) {
+    std::lock_guard<std::mutex> lock(offload_epochs_mutex);
+    auto& epoch = offload_epochs[client];
+    if (!epoch) epoch = std::make_shared<OffloadEpoch>();
+    return epoch;
+}
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol) {
@@ -529,6 +544,10 @@ Client::~Client() {
     hot_cache_handler_.reset();
     UnregisterLocalHotCacheMemory();
     hot_cache_.reset();
+    {
+        std::lock_guard<std::mutex> lock(offload_epochs_mutex);
+        offload_epochs.erase(this);
+    }
 }
 
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
@@ -4732,6 +4751,9 @@ void Client::StorageHeartbeatThreadMain() {
     int ping_fail_count = 0;
 
     auto remount_segment = [this]() {
+        // 先撤销旧任务世代，再重建 Master allocator。源复制持共享门，
+        // 所以新 PUT 无法在旧地址复制完成前重新占用该地址。
+        auto source_fence = detail::GetClientOffloadEpoch(this)->Advance();
         // This lock must be held until the remount rpc is finished,
         // otherwise there will be corner cases, e.g., a segment is
         // unmounted successfully first, and then remounted again in

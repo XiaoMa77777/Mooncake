@@ -29,6 +29,9 @@ option(
   OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
+option(
+  WITH_KVCLIENT_BACKEND
+  "build the kvclient offload backend (requires an installed kvclient SDK)" OFF)
 option(MOONCAKE_ENABLE_TEST_FAILPOINTS
        "Enable file-handshake failpoints for integration tests" OFF)
 if(MOONCAKE_ENABLE_TEST_FAILPOINTS)

@@ -105,6 +105,18 @@ if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
 endif()
 
+# kvclient offload backend. Optional: the default build keeps no kvclient
+# dependency, and selecting the backend without this option fails at startup
+# with a clear message instead of falling back to another backend silently.
+if(WITH_KVCLIENT_BACKEND)
+  find_package(kvclient CONFIG REQUIRED)
+  if(NOT TARGET kvclient::mooncake)
+    message(FATAL_ERROR
+      "WITH_KVCLIENT_BACKEND requires kvclient built with KVCLIENT_BUILD_MOONCAKE=ON")
+  endif()
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES kvclient_backend.cpp)
+endif()
+
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
 
@@ -428,6 +440,15 @@ if(USE_ASCEND
                              PRIVATE $ENV{ASCEND_PATH}/include)
 endif()
 
+if(WITH_KVCLIENT_BACKEND)
+  # kvclient_backend.cpp is guarded by this definition; without it the file
+  # compiles to nothing and the backend reports NOT_SUPPORTED.
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_WITH_KVCLIENT)
+  target_link_libraries(mooncake_store_client_objects
+                        PRIVATE kvclient::mooncake)
+endif()
+
 # Reduced Store library linked by mooncake_master.
 add_library(
   mooncake_store_master STATIC $<TARGET_OBJECTS:mooncake_store_shared_objects>
@@ -468,6 +489,15 @@ add_library(
   $<TARGET_OBJECTS:mooncake_store_master_objects>
   $<TARGET_OBJECTS:mooncake_store_client_objects>)
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
+
+if(WITH_KVCLIENT_BACKEND)
+  # TARGET_OBJECTS 不传播链接依赖，最终库需要显式链接适配库。
+  target_link_libraries(mooncake_store PRIVATE kvclient::mooncake)
+  # 普通消费端和测试需要看到后端类声明，但不需要包含 SDK 头文件。
+  target_compile_definitions(mooncake_store PUBLIC MOONCAKE_WITH_KVCLIENT)
+endif()
+
+
 target_link_libraries(
   mooncake_store
   PUBLIC mooncake_local_ssd

@@ -64,6 +64,13 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         config.enable_dfs = true;
     } else if (storage_backend_descriptor == "nvme_kv_storage_backend") {
         config.storage_backend_type = StorageBackendType::kNvmeKv;
+    } else if (storage_backend_descriptor == "kvclient_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kKvclient;
+#ifndef MOONCAKE_WITH_KVCLIENT
+        LOG(ERROR) << "Storage backend 'kvclient_storage_backend' was "
+                      "selected but this build has no kvclient support; "
+                      "rebuild with -DWITH_KVCLIENT_BACKEND=ON";
+#endif
     } else {
         LOG(ERROR) << "Unknown storage backend.";
     }

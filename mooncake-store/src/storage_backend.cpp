@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <optional>
 #include <regex>
 #include <string>
@@ -24,11 +25,13 @@
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
+#include "kvclient_backend.h"
 #include "nvme_kv_backend.h"
 #include "utils.h"
 #include "crc32c.h"
 #include "ascii_string.h"
 #include "environ.h"
+#include "environment_variables.h"
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -103,6 +106,33 @@ bool BucketBackendConfig::Validate() const {
     return true;
 }
 
+namespace {
+
+// 环境变量必须区分"未设置"和"设置了但无法解析"。Environ::ReadOr 在解析失败时
+// 会回退默认值；对上限类配置就等于把一次拼写错误变成"静默放宽限制"——部署想
+// 调小上限却拿到默认 4 MiB，且 Validate() 照样通过。未设置 → 保留默认；
+// 设置了但非法 → 记录原因，由 Validate() 明确拒绝启动。
+template <typename T>
+void ReadStrictOrReject(const EnvironmentVariable<T>& variable, T& value,
+                        std::string& reject_reason) {
+    const char* text = std::getenv(variable.name);
+    if (text == nullptr) {
+        return;
+    }
+    const auto parsed = Environ::Read(variable);
+    if (parsed.has_value()) {
+        value = *parsed;
+        return;
+    }
+    if (reject_reason.empty()) {
+        reject_reason = std::string(variable.name) + "='" + text +
+                        "' cannot be parsed; refusing to start instead of "
+                        "falling back to the default";
+    }
+}
+
+}  // namespace
+
 FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
     FilePerKeyConfig config;
 
@@ -113,6 +143,95 @@ FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
         Environ::GetBool("ENABLE_EVICTION", config.enable_eviction));
 
     return config;
+}
+
+KvclientBackendConfig KvclientBackendConfig::FromEnvironment() {
+    using Variables = FileStorageEnvironmentVariables;
+    KvclientBackendConfig config;
+
+    config.sdk_config_path =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_KVCLIENT_CONFIG_PATH,
+                        config.sdk_config_path);
+    config.index_directory =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_KVCLIENT_INDEX_DIR,
+                        config.index_directory);
+    config.index_path =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_KVCLIENT_INDEX_PATH,
+                        config.index_path);
+    config.prefix = Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_KVCLIENT_PREFIX,
+                                    config.prefix);
+    config.layout = Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_KVCLIENT_LAYOUT,
+                                    config.layout);
+    // 上限与超时必须区分未设置和设置但非法：解析失败要拒绝启动，不能回退默认。
+    ReadStrictOrReject(Variables::MOONCAKE_OFFLOAD_KVCLIENT_MAX_OBJECT_BYTES,
+                       config.max_object_bytes, config.invalid_environment);
+    ReadStrictOrReject(Variables::MOONCAKE_OFFLOAD_KVCLIENT_TIMEOUT_MS,
+                       config.timeout_ms, config.invalid_environment);
+    config.device_payloads = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_KVCLIENT_DEVICE_PAYLOADS,
+        config.device_payloads);
+
+    return config;
+}
+
+bool KvclientBackendConfig::Validate() const {
+    // 解析失败的环境变量先报出来：它比任何字段级默认值都更需要被看见。
+    if (!invalid_environment.empty()) {
+        LOG(ERROR) << "KvclientBackendConfig: " << invalid_environment;
+        return false;
+    }
+    if (sdk_config_path.empty()) {
+        LOG(ERROR) << "KvclientBackendConfig: "
+                      "MOONCAKE_OFFLOAD_KVCLIENT_CONFIG_PATH is required";
+        return false;
+    }
+    if (prefix.empty()) {
+        LOG(ERROR) << "KvclientBackendConfig: prefix must not be empty";
+        return false;
+    }
+    if (layout.empty()) {
+        LOG(ERROR) << "KvclientBackendConfig: layout must not be empty";
+        return false;
+    }
+    // 旧的分片配置随单值格式一并移除。仍设置它说明部署按旧格式预期运行，
+    // 必须明确报错而不是静默忽略一个已经失效的开关。
+    if (std::getenv("MOONCAKE_OFFLOAD_KVCLIENT_FRAGMENT_BYTES") != nullptr) {
+        LOG(ERROR) << "KvclientBackendConfig: "
+                      "MOONCAKE_OFFLOAD_KVCLIENT_FRAGMENT_BYTES has been "
+                      "removed; one logical key now maps to exactly one Value. "
+                      "Use MOONCAKE_OFFLOAD_KVCLIENT_MAX_OBJECT_BYTES instead";
+        return false;
+    }
+    if (max_object_bytes <= 0 ||
+        max_object_bytes > static_cast<int64_t>(4 * kMB)) {
+        LOG(ERROR) << "KvclientBackendConfig: max_object_bytes must be in "
+                      "[1, 4194304]";
+        return false;
+    }
+    if (timeout_ms <= 0 ||
+        timeout_ms > std::numeric_limits<uint32_t>::max()) {
+        LOG(ERROR) << "KvclientBackendConfig: timeout_ms must fit a positive "
+                      "uint32_t";
+        return false;
+    }
+    if (device_payloads) {
+        LOG(ERROR) << "KvclientBackendConfig: DEVICE_PAYLOADS=true is not "
+                      "supported; FileStorage supplies host buffers";
+        return false;
+    }
+    const std::filesystem::path path(
+        index_path.empty() ? index_directory : index_path);
+    if (!path.empty() && !path.is_absolute()) {
+        LOG(ERROR) << "KvclientBackendConfig: index path must be absolute";
+        return false;
+    }
+    if (!index_path.empty() &&
+        (path.filename().empty() || path.filename() == "." ||
+         path.filename() == "..")) {
+        LOG(ERROR) << "KvclientBackendConfig: INDEX_PATH must name a file";
+        return false;
+    }
+    return true;
 }
 
 BucketBackendConfig BucketBackendConfig::FromEnvironment() {
@@ -5693,6 +5812,24 @@ CreateStorageBackend(const FileStorageConfig& config) {
         }
         case StorageBackendType::kNvmeKv:
             return std::make_shared<NvmeKvStorageBackend>(config);
+
+        case StorageBackendType::kKvclient: {
+#ifdef MOONCAKE_WITH_KVCLIENT
+            auto kvclient_backend_config =
+                KvclientBackendConfig::FromEnvironment();
+            if (!kvclient_backend_config.Validate()) {
+                throw std::invalid_argument("Invalid KvclientBackendConfig");
+            }
+            return std::make_shared<KvclientStorageBackend>(
+                config, kvclient_backend_config);
+#else
+            LOG(ERROR) << "Storage backend 'kvclient_storage_backend' was "
+                          "requested but this build has no kvclient support; "
+                          "rebuild with -DWITH_KVCLIENT_BACKEND=ON";
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+        }
+
 
         case StorageBackendType::kDistributed: {
             auto distributed_config =

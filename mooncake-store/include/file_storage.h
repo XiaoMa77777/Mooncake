@@ -1,5 +1,7 @@
 #pragma once
 
+#include <deque>
+
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
@@ -19,6 +21,17 @@ class FileStorage {
     tl::expected<void, ErrorCode> Init();
 
     void RemoveAll();
+
+    /**
+     * @brief Stops the heartbeat and buffer-GC threads and waits for them.
+     *
+     * Process teardown must call this *before* it releases the buffers those
+     * threads read: the heartbeat stages copies out of the client segment and
+     * the client buffer, so freeing either while it is mid-copy turns the
+     * staging memcpy into a read of unmapped memory. Idempotent; the destructor
+     * calls it as well, so a caller that forgets it keeps the old behaviour.
+     */
+    void Shutdown();
 
     /**
      * @brief Deregisters this store's disk tier from the master, then waits out
@@ -94,6 +107,7 @@ class FileStorage {
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
+    friend class FileStorageRecoveryTest;
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -118,6 +132,40 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> OffloadObjects(
         const std::vector<OffloadTaskItem>& offloading_objects);
+
+    // Processes at most `budget` of wall clock, moving the unattempted tail into
+    // `remaining` instead of dropping it. `remaining` may be null, in which case
+    // the old "finish everything" behaviour is kept for backends that do not go
+    // through the master's take-pending queue.
+    tl::expected<void, ErrorCode> OffloadObjectsWithEpoch(
+        const std::vector<OffloadTaskItem>& offloading_objects,
+        uint64_t task_epoch, std::chrono::milliseconds budget = std::chrono::milliseconds::max(),
+        std::vector<OffloadTaskItem>* remaining = nullptr);
+
+    /**
+     * @brief Where one offload tick's wall clock actually went.
+     *
+     * The backend's own durable-commit cost is measured separately; without
+     * this breakdown the wrapper (source query, D2H staging, master
+     * notification) is indistinguishable from it, which is exactly the gap the
+     * acceptance plan asks to close ("分别统计后端已提交和 Master 已可见").
+     */
+    struct OffloadPhaseTimings {
+        uint64_t query_us{0};
+        uint64_t stage_us{0};
+        uint64_t backend_us{0};
+        uint64_t notify_us{0};
+        uint64_t objects{0};
+        uint64_t buckets{0};
+
+        uint64_t total_us() const {
+            return query_us + stage_us + backend_us + notify_us;
+        }
+    };
+
+    tl::expected<void, ErrorCode> OffloadObjectsBatch(
+        const std::vector<OffloadTaskItem>& offloading_objects,
+        uint64_t task_epoch, OffloadPhaseTimings* timings = nullptr);
 
     /**
      * @brief Classifies a BatchOffload error as affecting only the current
@@ -219,7 +267,17 @@ class FileStorage {
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
-    std::atomic<bool> metadata_resync_pending_{false};
+    // Tasks the master already handed over but a tick's budget did not reach.
+    // They stay in the master's offloading_tasks until this client notifies, so
+    // carrying them is not a leak; the master's TTL reaper stays the backstop.
+    // Only the heartbeat thread touches this.
+    struct CarriedTask {
+        uint64_t epoch;
+        OffloadTaskItem task;
+    };
+    std::deque<CarriedTask> carried_tasks_;
+    // 恢复状态（代次、扫描票据、恢复计数）旁路保存在 offload_recovery.h 的
+    // FileStorageRecoveryState 里，避免改动 FileStorageConfig 布局与既有虚表。
     // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the
     // heartbeat -- which would otherwise re-mount the segment the drain just
     // deregistered -- and aborts an in-flight metadata rescan. Checked at
@@ -227,6 +285,9 @@ class FileStorage {
     // again under offloading_mutex_ before the heartbeat RPC, because a tick
     // parked on that lock passed the entry check before the drain latched.
     std::atomic<bool> draining_{false};
+    // 让 Shutdown 幂等：析构与收尾钩子都可能调用它。
+    std::mutex shutdown_mutex_;
+    bool shutdown_complete_ = false;
 };
 
 }  // namespace mooncake

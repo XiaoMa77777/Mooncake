@@ -164,7 +164,10 @@ enum class StorageBackendType {
     kBucket,
     kOffsetAllocator,
     kDistributed,
-    kNvmeKv
+    kNvmeKv,
+    // Appended so the numeric values of the existing backends stay stable.
+    // Only available when the build enables WITH_KVCLIENT_BACKEND.
+    kKvclient
 };
 
 static constexpr size_t kKB = 1024;
@@ -179,6 +182,42 @@ struct FilePerKeyConfig {
     bool Validate() const;
 
     static FilePerKeyConfig FromEnvironment();
+};
+
+// kvclient 后端配置。共享对象的客户端必须使用相同的 prefix 和 layout；
+// 每个逻辑 key 对应一个不超过 max_object_bytes 的物理 Value，远端不再保存
+// manifest，也不再存在分片。本地索引只记录本客户端写过的对象，并用于重启恢复。
+struct KvclientBackendConfig {
+    // 必填：kvclient SDK 配置文件路径。
+    std::string sdk_config_path;
+
+    // 未指定 index_path 时，在该目录下使用固定文件 client.index。
+    // 空值回退到 FileStorageConfig::storage_filepath。目录必须持久化。
+    std::string index_directory;
+
+    // 共享对象格式，所有互读客户端必须保持一致。
+    std::string prefix = "mooncake-offload";
+    std::string layout = "v1";
+    // 单值上限，默认且最大 4 MiB；允许设置更小的预算用于验证实际上限。
+    int64_t max_object_bytes = 4 * kMB;
+
+    // 单次 SDK 操作超时，单位为毫秒。
+    int64_t timeout_ms = 15000;
+
+    // 环境变量设置了但无法解析时的说明。非空表示配置非法，Validate() 必须
+    // 拒绝启动：ReadOr 式的静默回退会把拼写错误变成一个放宽后的上限。
+    std::string invalid_environment;
+
+    // 当前 FileStorage 提供 HOST 数据且未注册设备 arena，true 会被拒绝。
+    bool device_payloads = false;
+
+    // 优先使用的绝对索引文件路径。每个并发客户端/rank 必须独占一条路径，
+    // 重启后复用相同路径；不能使用 PID 或随机值作为持久身份。
+    std::string index_path;
+
+    bool Validate() const;
+
+    static KvclientBackendConfig FromEnvironment();
 };
 
 enum class BucketEvictionPolicy {

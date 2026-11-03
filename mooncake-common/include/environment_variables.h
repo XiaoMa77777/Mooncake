@@ -36,6 +36,20 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_USE_URING);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_USE_URING);
+
+    // kvclient backend (MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=
+    // kvclient_storage_backend). The SDK configuration file is mandatory; the
+    // remaining values default to the shared single-value object format and must
+    // match across every client that shares offloaded objects. Each logical key
+    // maps to exactly one physical Value of at most MAX_OBJECT_BYTES.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_KVCLIENT_CONFIG_PATH);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_KVCLIENT_INDEX_DIR);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_KVCLIENT_INDEX_PATH);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_KVCLIENT_PREFIX);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_KVCLIENT_LAYOUT);
+    MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_KVCLIENT_MAX_OBJECT_BYTES);
+    MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_KVCLIENT_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_KVCLIENT_DEVICE_PAYLOADS);
 };
 
 #undef MC_DEFINE_ENV_VAR

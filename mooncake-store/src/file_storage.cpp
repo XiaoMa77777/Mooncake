@@ -1,8 +1,13 @@
 #include "file_storage.h"
+#include "offload_recovery.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -19,6 +24,51 @@
 namespace mooncake {
 
 namespace {
+
+// 单批卸载的对象数与字节上限。这两项直接决定「两道持久化屏障与一轮网络
+// 往返被多少对象摊掉」，因此必须可由部署调整并记录，而不是写死：字节上限
+// 对 1.25 MiB 对象只允许 16 MiB / 1.25 MiB = 12 个，仅调大对象数无效。
+// 默认与既有行为一致；非法取值拒绝启动，不静默采用默认值。
+struct OffloadBatchLimits {
+    size_t max_keys = 64;
+    uint64_t max_bytes = 16ULL * 1024ULL * 1024ULL;
+};
+
+uint64_t ReadBatchLimit(const char* name, uint64_t fallback, uint64_t low,
+                        uint64_t high) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || *text == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || value < low || value > high) {
+        throw std::invalid_argument(std::string(name) +
+                                    " must be an integer in [" +
+                                    std::to_string(low) + ", " +
+                                    std::to_string(high) + "]");
+    }
+    return value;
+}
+
+const OffloadBatchLimits& OffloadBatchLimit() {
+    static const OffloadBatchLimits limits = [] {
+        OffloadBatchLimits out;
+        out.max_keys = static_cast<size_t>(ReadBatchLimit(
+            "MOONCAKE_OFFLOAD_KVCLIENT_BATCH_KEYS", out.max_keys, 1, 4096));
+        out.max_bytes = ReadBatchLimit("MOONCAKE_OFFLOAD_KVCLIENT_BATCH_BYTES",
+                                       out.max_bytes, 1ULL << 20, 1ULL << 30);
+        LOG(INFO) << "kvclient offload batch limits: max_keys=" << out.max_keys
+                  << " max_bytes=" << out.max_bytes;
+        return out;
+    }();
+    return limits;
+}
+
+std::mutex recovery_states_mutex;
+std::unordered_map<const FileStorage*,
+                   std::shared_ptr<detail::FileStorageRecoveryState>>
+    recovery_states;
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
@@ -37,6 +87,14 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 }
 
 }  // namespace
+
+std::shared_ptr<detail::FileStorageRecoveryState>
+detail::GetFileStorageRecoveryState(const FileStorage* storage) {
+    std::lock_guard<std::mutex> lock(recovery_states_mutex);
+    auto& state = recovery_states[storage];
+    if (!state) state = std::make_shared<FileStorageRecoveryState>();
+    return state;
+}
 
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
@@ -114,10 +172,40 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         }
     }
 #endif
+    auto recovery = detail::GetFileStorageRecoveryState(this);
+    recovery->epoch = detail::GetClientOffloadEpoch(client_.get());
+    recovery->observed_epoch = recovery->epoch->Current();
+    recovery->query = [this](const auto& keys, const auto& tenant, auto& slices) {
+        return BatchQuerySegmentSlices(keys, tenant, slices);
+    };
+    recovery->fetch = [this](bool enabled, auto& tasks) {
+        return client_->OffloadObjectHeartbeat(enabled, tasks);
+    };
+    recovery->mount = [this](bool enabled) {
+        return client_->MountLocalDiskSegment(enabled);
+    };
+    recovery->report = [this](int64_t capacity) {
+        return client_->ReportSsdCapacity(capacity);
+    };
+    recovery->notify = [this](const auto& tasks, const auto& metadatas) {
+        return client_->NotifyOffloadSuccess(tasks, metadatas);
+    };
+    recovery->poll_remove = [this]() { return client_->PollRemoveAll(); };
 }
 
-FileStorage::~FileStorage() {
+FileStorage::~FileStorage() { Shutdown(); }
+
+// 心跳与 GC 线程都会从客户端持有的内存里读数据（暂存拷贝、读取结果），
+// 所以"停止线程"必须先于"释放内存"。收尾路径在解除段映射之前调用本函数；
+// 幂等，析构也走同一条路。
+void FileStorage::Shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(shutdown_mutex_);
+        if (shutdown_complete_) return;
+        shutdown_complete_ = true;
+    }
     LOG(INFO) << "Shutdown FileStorage...";
+    draining_.store(true);
     heartbeat_running_ = false;
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
@@ -126,6 +214,10 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    // future 必须在后端、draining_ 和回调仍有效时结束。
+    if (rescan_future_.valid()) rescan_future_.wait();
+    std::lock_guard<std::mutex> lock(recovery_states_mutex);
+    recovery_states.erase(this);
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -183,44 +275,53 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
-    auto scan_meta_result = storage_backend_->ScanMeta(
-        [this](const std::vector<std::string>& keys,
-               std::vector<StorageObjectMetadata>& metadatas) {
-            for (auto& metadata : metadatas) {
-                metadata.transport_endpoint = local_rpc_addr_;
-            }
-            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-            auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
-            if (!add_object_result) {
-                LOG(ERROR) << "Failed to add object to master: "
-                           << add_object_result.error();
-                return add_object_result.error();
-            }
-            return ErrorCode::OK;
-        });
+    auto recovery = detail::GetFileStorageRecoveryState(this);
+    recovery->RequestScan();
+    auto scan_meta_result = ReRegisterOffloadedObjects();
+    if (!scan_meta_result) return scan_meta_result;
 
-    if (!scan_meta_result) {
-        if (config_.enable_dfs &&
-            scan_meta_result.error() == ErrorCode::NOT_SUPPORTED) {
-            LOG(INFO) << "Currently, DFS backend does not support ScanMeta; "
-                         "skip re-registering offloaded objects";
-        } else {
-            LOG(ERROR) << "Failed to scan meta and send to master: "
-                       << scan_meta_result.error();
-            return scan_meta_result;
-        }
+    // R2：0（默认）保持按配置间隔心跳的既有行为；非零则按毫秒节拍轮询取任务。
+    const std::uint64_t fastPollMs = [&]() {
+        const char* text = std::getenv("MOONCAKE_OFFLOAD_FAST_POLL_MS");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ULL;
+    }();
+    if (fastPollMs > 0) {
+        LOG(INFO) << "FileStorage offload polling interval: " << fastPollMs
+                  << "ms (heartbeat interval " << config_.heartbeat_interval_seconds
+                  << "s still governs control work)";
     }
-
     heartbeat_running_.store(true);
-    heartbeat_thread_ = std::thread([this]() {
+    heartbeat_thread_ = std::thread([this, fastPollMs]() {
         LOG(INFO) << "Starting periodic task with interval: "
                   << config_.heartbeat_interval_seconds
                   << "s, running is: " << heartbeat_running_.load();
         while (heartbeat_running_.load()) {
             Heartbeat();
-            std::this_thread::sleep_for(
-                std::chrono::seconds(config_.heartbeat_interval_seconds));
+            // Sleeping the full interval after a tick that ran out of budget
+            // idles the offload path for a fixed slice of every cycle, which
+            // settles the sustained rate at the heartbeat's duty cycle
+            // (measured: ~84 of the ~140 objects/s the backend can drain).
+            // With tasks still queued locally there is nothing to wait for, so
+            // yield briefly and continue; Ping, remount and the recovery scan
+            // all still run once per cycle. An idle tick keeps the configured
+            // interval unchanged.
+            if (!carried_tasks_.empty()) {
+                // 本地还有没处理完的任务：什么都不用等。
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } else if (fastPollMs > 0) {
+                // R2 单项实验：把"取任务"的节拍与配置的心跳间隔解耦。配置的间隔是
+                // 秒级（默认 1 s），而 PutEnd 之后到下一个心跳之间的空档会直接加到
+                // 端到端时间上（实测 128 KiB/4096 对象：tick 本身 0.64 s，端到端
+                // 2.42 s，其中约 0.9 s 是这段空档）。设为非零后按该毫秒节拍轮询，
+                // 控制/恢复逻辑仍在每次 Heartbeat() 里跑完，代价是更频繁的控制 RPC。
+                const auto slice = std::min<std::uint64_t>(
+                    fastPollMs,
+                    static_cast<std::uint64_t>(config_.heartbeat_interval_seconds) * 1000ULL);
+                std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+            } else {
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(config_.heartbeat_interval_seconds));
+            }
         }
     });
     client_buffer_gc_running_.store(true);
@@ -308,6 +409,123 @@ bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
+    const auto recovery = detail::GetFileStorageRecoveryState(this);
+    return OffloadObjectsWithEpoch(offloading_objects,
+                                   recovery->epoch->Current());
+}
+
+tl::expected<void, ErrorCode> FileStorage::OffloadObjectsWithEpoch(
+    const std::vector<OffloadTaskItem>& offloading_objects,
+    uint64_t task_epoch, std::chrono::milliseconds budget,
+    std::vector<OffloadTaskItem>* remaining) {
+    const auto recovery = detail::GetFileStorageRecoveryState(this);
+    if (config_.storage_backend_type != StorageBackendType::kKvclient) {
+        return OffloadObjectsBatch(offloading_objects, task_epoch);
+    }
+    // This batch is what the backend's durable barrier amortizes over, so its
+    // size is not just an epoch-check granularity choice: at 8 objects the
+    // backend pays two fsyncs per 8 objects, which the phase measurement puts
+    // at ~31% of the per-object cost. Bytes still bound the batch, and the
+    // epoch is re-checked between batches, so a larger count does not widen the
+    // window in which a remount goes unnoticed.
+    const size_t kMaxBatchKeys = OffloadBatchLimit().max_keys;
+    const uint64_t kMaxBatchBytes = OffloadBatchLimit().max_bytes;
+    // Master 的 OffloadObjectHeartbeat 是 take-pending：本 tick 取到的任务已经从
+    // 待办队列里摘走，只有 NotifyOffloadSuccess 会把它变成「已卸载」或「已失败」。
+    // 因此超出本 tick 预算的部分**不能丢**，也不能按失败 NACK（那会 dec_refcnt 源
+    // 副本）。调用方把未尝试的尾部放进本地队列，下一 tick 继续；任务此时仍在 Master
+    // 的 offloading_tasks 里，客户端若最终没能处理，Master 的 TTL 回收仍是兜底。
+    const auto tick_started = std::chrono::steady_clock::now();
+    const auto deadline = tick_started + budget;
+    const bool has_budget = budget != std::chrono::milliseconds::max();
+    constexpr auto kSlowTickWarning = std::chrono::milliseconds(2000);
+    OffloadPhaseTimings timings;
+    for (size_t begin = 0; begin < offloading_objects.size();) {
+        // 慢速存储不持门；每小批之间让 Ping 重挂并及时中断旧任务。
+        if (recovery->epoch->Current() != task_epoch || draining_.load()) {
+            recovery->RecordCancelledTasks(offloading_objects.size() - begin);
+            recovery->RequestScan();
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        size_t end = begin;
+        uint64_t bytes = 0;
+        while (end < offloading_objects.size() && end - begin < kMaxBatchKeys) {
+            const auto size = static_cast<uint64_t>(
+                std::max<int64_t>(offloading_objects[end].size, 0));
+            if (end != begin && (bytes >= kMaxBatchBytes ||
+                                 size > kMaxBatchBytes - bytes)) break;
+            bytes += size;
+            ++end;
+        }
+        if (has_budget && begin != 0 && std::chrono::steady_clock::now() >= deadline) {
+            if (remaining != nullptr) {
+                remaining->insert(remaining->end(),
+                                  offloading_objects.begin() + static_cast<ptrdiff_t>(begin),
+                                  offloading_objects.end());
+            } else {
+                LOG(WARNING) << "[OFFLOAD] budget reached with "
+                             << (offloading_objects.size() - begin)
+                             << " task(s) left and no carry-over queue";
+            }
+            return {};
+        }
+        std::vector<OffloadTaskItem> batch(offloading_objects.begin() + begin,
+                                         offloading_objects.begin() + end);
+        auto result = OffloadObjectsBatch(batch, task_epoch, &timings);
+        if (!result) {
+            auto source_guard = recovery->epoch->Read();
+            if (!source_guard.Matches(task_epoch)) {
+                recovery->RecordCancelledTasks(offloading_objects.size() - begin);
+                recovery->RequestScan();
+                return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+            }
+            // 正常世代下的失败：本批已由 OffloadObjectsBatch 按既有的失败语义
+            // 上报。尚未尝试的任务保持 pending，下一周期重新下发即可——见上方
+            // 关于不可 NACK 的说明。
+            return result;
+        }
+        begin = end;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - tick_started;
+    if (!offloading_objects.empty()) {
+        const auto per_object = [&timings](uint64_t us) {
+            return timings.objects ? static_cast<double>(us) / timings.objects / 1000.0
+                                   : 0.0;
+        };
+        LOG(INFO) << "[OFFLOAD-PHASES] objects=" << timings.objects
+                  << " buckets=" << timings.buckets
+                  << " wall_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                  << " query_us=" << timings.query_us
+                  << " stage_us=" << timings.stage_us
+                  << " backend_us=" << timings.backend_us
+                  << " notify_us=" << timings.notify_us
+                  << " per_object_ms{query=" << per_object(timings.query_us)
+                  << ",stage=" << per_object(timings.stage_us)
+                  << ",backend=" << per_object(timings.backend_us)
+                  << ",notify=" << per_object(timings.notify_us)
+                  << ",total=" << per_object(timings.total_us()) << "}";
+    }
+    if (elapsed >= kSlowTickWarning) {
+        recovery->RecordSlowTick();
+        LOG(WARNING) << "[OFFLOAD] heartbeat tick took "
+                     << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                     << "ms for " << offloading_objects.size()
+                     << " task(s), generation=" << task_epoch;
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::OffloadObjectsBatch(
+    const std::vector<OffloadTaskItem>& offloading_objects,
+    uint64_t task_epoch, OffloadPhaseTimings* timings) {
+    const auto now_us = [] {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    };
+    const auto recovery = detail::GetFileStorageRecoveryState(this);
     if (offloading_objects.empty()) {
         return {};
     }
@@ -342,7 +560,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     }
 
     auto complete_handler =
-        [this, &task_by_storage_key](
+        [this, recovery, task_epoch, now_us, timings, &task_by_storage_key](
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
         VLOG(1) << "Success to store objects, keys count: " << keys.size();
@@ -359,8 +577,17 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             tasks.push_back(it->second);
         }
-        auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
+        auto source_guard = recovery->epoch->Read();
+        if (!source_guard.Matches(task_epoch) || draining_.load()) {
+            recovery->RequestScan();
+            return ErrorCode::SEGMENT_NOT_FOUND;
+        }
+        const auto notify_started = now_us();
+        auto result = recovery->notify(tasks, metadatas);
+        if (timings) timings->notify_us += now_us() - notify_started;
         if (!result) {
+            if (result.error() == ErrorCode::SEGMENT_NOT_FOUND)
+                recovery->RequestScan();
             LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccess failed with error: "
                        << result.error() << " keys count: " << keys.size();
             return result.error();
@@ -379,6 +606,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::optional<ErrorCode> abort_error;
 
     for (const auto& keys : buckets_keys) {
+        std::optional<detail::OffloadEpoch::ReadGuard> source_guard;
+        source_guard.emplace(*recovery->epoch);
+        if (!source_guard->Matches(task_epoch) || draining_.load()) {
+            recovery->RequestScan();
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        recovery->source_lease_deadline =
+            std::chrono::steady_clock::time_point::max();
         for (const auto& k : keys) all_bucket_keys.insert(k);
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
@@ -398,8 +633,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
-            [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
+            const auto query_started = now_us();
+            [[maybe_unused]] auto query_result = recovery->query(
                 user_keys, tenant_id, user_batch_object);
+            if (timings) {
+                timings->query_us += now_us() - query_started;
+                timings->buckets += 1;
+                timings->objects += user_keys.size();
+            }
             // BatchQuerySegmentSlices is now best-effort: it always returns
             // OK. Keys present in user_batch_object go to batch_object; the
             // rest are reported as failed.
@@ -409,6 +650,11 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 if (it != user_batch_object.end()) {
                     batch_object.emplace(storage_key, std::move(it->second));
                 } else {
+                    // The master still lists this task but the local memory
+                    // replica it points at is already gone, so there is nothing
+                    // to copy. Reporting it as failed makes the master drop the
+                    // task and the object with it.
+                    recovery->RecordNackSite(detail::FileStorageRecoveryState::NackSite::kSourceMissing);
                     failed_tasks.push_back(task);
                 }
             }
@@ -425,10 +671,18 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
 
+        const auto stage_started = now_us();
         for (auto& [obj_key, slices] : batch_object) {
             std::vector<Slice> host_slices;
             bool obj_success = true;
             for (const auto& slice : slices) {
+                if (std::chrono::steady_clock::now() >=
+                    recovery->source_lease_deadline) {
+                    obj_success = false;
+                    recovery->RecordNackSite(detail::FileStorageRecoveryState::NackSite::kLeaseDiscard);
+                    failed_tasks.push_back(task_by_storage_key.at(obj_key));
+                    break;
+                }
                 device::PointerInfo info{};
                 auto* device =
                     runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
@@ -440,9 +694,18 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                         LOG(ERROR) << "D2H staging failed for key: " << obj_key;
                         pinned_buffer_pool_->Release(std::move(buf));
                         obj_success = false;
+                        recovery->RecordNackSite(detail::FileStorageRecoveryState::NackSite::kD2H);
                         failed_tasks.push_back(task_by_storage_key.at(obj_key));
                         break;
                     }
+                    host_slices.emplace_back(Slice{buf.data, slice.size});
+                    staging_bufs.push_back(std::move(buf));
+                } else if (config_.storage_backend_type ==
+                           StorageBackendType::kKvclient) {
+                    // HOST 也必须拥有独立快照，不能将旧 allocator 地址
+                    // 留给会执行网络 I/O、fsync 的慢速持久化后端。
+                    auto buf = PinnedBufferPool::Buffer::Pageable(slice.size);
+                    std::memcpy(buf.data, slice.ptr, slice.size);
                     host_slices.emplace_back(Slice{buf.data, slice.size});
                     staging_bufs.push_back(std::move(buf));
                 } else {
@@ -453,6 +716,21 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 host_batch_object[obj_key] = std::move(host_slices);
             }
         }
+
+        // 租约可能在 D2H/复制中到期；这种快照必须丢弃，不能发布。
+        if (std::chrono::steady_clock::now() >=
+            recovery->source_lease_deadline) {
+            LOG(WARNING) << "[OFFLOAD] source lease expired while staging, "
+                         << "discarding " << host_batch_object.size()
+                         << " staged object(s)";
+            recovery->RecordLeaseDiscard(host_batch_object.size());
+            recovery->RecordNackSite(detail::FileStorageRecoveryState::NackSite::kLeaseDiscard, host_batch_object.size());
+            for (const auto& [key, _] : host_batch_object)
+                failed_tasks.push_back(task_by_storage_key.at(key));
+            host_batch_object.clear();
+        }
+        source_guard.reset();
+        if (timings) timings->stage_us += now_us() - stage_started;
 
         // If every object in this bucket failed D2H staging, host_batch_object
         // is empty (those keys are already in failed_tasks). Skip BatchOffload,
@@ -495,12 +773,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             return res;
         };
+        const auto backend_started = now_us();
         auto offload_res = storage_backend_->BatchOffload(
             host_batch_object, bucket_complete_handler,
             [this](const std::vector<std::string>& evicted_keys) {
                 return NotifyEvictedDiskReplicas(evicted_keys);
             });
 
+        if (timings) timings->backend_us += now_us() - backend_started;
         // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
             pinned_buffer_pool_->Release(std::move(buf));
@@ -514,6 +794,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             // offloading tasks and source-replica refcounts from leaking until
             // the put_start_release_timeout_sec_ TTL reaper fires.
             for (const auto& [key, _] : host_batch_object) {
+                recovery->RecordNackSite(detail::FileStorageRecoveryState::NackSite::kBucketFailed);
                 failed_tasks.push_back(task_by_storage_key.at(key));
             }
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
@@ -538,18 +819,37 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // so they never reach BatchOffload or complete_handler.
     for (const auto& [storage_key, task] : task_by_storage_key) {
         if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
+            recovery->RecordNackSite(detail::FileStorageRecoveryState::NackSite::kUnvisited);
             failed_tasks.push_back(task);
         }
     }
 
     if (!failed_tasks.empty()) {
+        LOG(WARNING) << "[OFFLOAD] reporting " << failed_tasks.size()
+                     << " task(s) back to the master as failed, sample="
+                     << failed_tasks.front().key
+                     << " buckets=" << buckets_keys.size()
+                     << " all_bucket_keys=" << all_bucket_keys.size()
+                     << " tasks=" << task_by_storage_key.size()
+                     << " by_site{source_missing=" << recovery->NackSite(detail::FileStorageRecoveryState::NackSite::kSourceMissing)
+                     << ",d2h=" << recovery->NackSite(detail::FileStorageRecoveryState::NackSite::kD2H)
+                     << ",lease=" << recovery->NackSite(detail::FileStorageRecoveryState::NackSite::kLeaseDiscard)
+                     << ",bucket_failed=" << recovery->NackSite(detail::FileStorageRecoveryState::NackSite::kBucketFailed)
+                     << ",unvisited=" << recovery->NackSite(detail::FileStorageRecoveryState::NackSite::kUnvisited)
+                     << "}";
+        auto source_guard = recovery->epoch->Read();
+        if (!source_guard.Matches(task_epoch) || draining_.load()) {
+            recovery->RequestScan();
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
         std::vector<StorageObjectMetadata> failed_metadatas;
         failed_metadatas.reserve(failed_tasks.size());
         for (size_t i = 0; i < failed_tasks.size(); ++i) {
             failed_metadatas.push_back(StorageObjectMetadata{-1, 0, 0, -1, ""});
         }
-        auto result =
-            client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
+        const auto notify_started = now_us();
+        auto result = recovery->notify(failed_tasks, failed_metadatas);
+        if (timings) timings->notify_us += now_us() - notify_started;
         if (!result) {
             LOG(WARNING) << "[OFFLOAD] NotifyOffloadSuccess for failed tasks "
                             "returned error: "
@@ -659,123 +959,133 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // Ping on the storage heartbeat thread, not here, so the client stays
     // alive for its memory segments.
     if (draining_.load()) {
+        carried_tasks_.clear();
         return {};
     }
 
-    // Join previous rescan if completed
-    if (rescan_future_.valid() && rescan_future_.wait_for(std::chrono::seconds(
-                                      0)) == std::future_status::ready) {
-        rescan_future_ = std::future<void>();
+    const auto recovery = detail::GetFileStorageRecoveryState(this);
+    if (rescan_future_.valid() &&
+        rescan_future_.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready) {
+        try {
+            rescan_future_.get();
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Background metadata rescan exception: " << error.what();
+        }
     }
-
-    // Retry metadata resync if previous attempt failed.
-    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
-        LOG(INFO) << "Retrying background metadata rescan";
-        rescan_future_ = std::async(std::launch::async, [this]() {
-            auto result = ReRegisterOffloadedObjects();
-            if (!result) {
-                LOG(ERROR) << "Background metadata rescan retry "
-                           << "failed: " << result.error();
-            } else {
-                metadata_resync_pending_.store(false);
-            }
-        });
+    const auto current_epoch = recovery->epoch->Current();
+    if (recovery->observed_epoch != current_epoch) {
+        recovery->observed_epoch = current_epoch;
+        recovery->RequestScan();
     }
+    auto start_rescan = [&]() {
+        if (recovery->HasPendingScan() && !rescan_future_.valid() &&
+            !draining_.load()) {
+            rescan_future_ = std::async(std::launch::async, [this]() {
+                auto result = ReRegisterOffloadedObjects();
+                if (!result) {
+                    LOG(ERROR) << "Background metadata rescan failed: "
+                               << result.error();
+                }
+            });
+        }
+    };
+    // A recovery that re-registered objects may still be shadowed by a stale
+    // LOCAL_DISK replica owned by a dead client (see ScheduleFollowupScan); the
+    // follow-up runs once that owner has been reaped.
+    if (recovery->ConsumeFollowupScan()) {
+        LOG(INFO) << "[RECOVERY] running scheduled follow-up rescan, generation="
+                  << recovery->epoch->Current();
+        recovery->RequestScan();
+    }
+    start_rescan();
 
-    std::vector<OffloadTaskItem>
-        offloading_objects;  // Objects selected for offloading
-
-    // === STEP 1: Send heartbeat and get offloading decisions ===
+    std::vector<OffloadTaskItem> offloading_objects;
+    uint64_t task_epoch = 0;
     {
         MutexLocker locker(&offloading_mutex_);
-        // Re-checked under the lock: the entry check above is only a fast
-        // path. A drain (which latches and deregisters under this same
-        // mutex) may have completed while this tick was parked on it; going
-        // on would hit SEGMENT_NOT_FOUND below and re-mount the segment the
-        // drain just deregistered.
-        if (draining_.load()) {
-            return {};
-        }
+        if (draining_.load()) return {};
         auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
-            return client_->OffloadObjectHeartbeat(enable_offloading_,
-                                                   offloading_objects);
+            // 取任务与其所属世代是同一原子区间，不能取完后才读 epoch。
+            auto source_guard = recovery->epoch->Read();
+            task_epoch = source_guard.generation();
+            offloading_objects.clear();
+            return recovery->fetch(enable_offloading_, offloading_objects);
         };
         auto heartbeat_result = fetch_offload_tasks();
-        if (!heartbeat_result) {
-            ErrorCode err = heartbeat_result.error();
-            if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-                // Master lost our LOCAL_DISK segment (likely restarted).
-                // Re-register the segment, retry the heartbeat, and
-                // trigger async ScanMeta to re-register object metadata.
-                LOG(WARNING) << "OffloadObjectHeartbeat returned "
-                             << "SEGMENT_NOT_FOUND, attempting to "
-                             << "re-register local disk segment and "
-                             << "re-register object metadata";
-                auto remount_result =
-                    client_->MountLocalDiskSegment(enable_offloading_);
-                if (remount_result) {
-                    // Report configured SSD capacity so the Master can
-                    // restore file_total_capacity_ (the denominator in
-                    // "SSD Storage: X / Y").  This was lost on restart;
-                    // re-reporting it here avoids the 0 B display.
-                    if (config_.total_size_limit > 0) {
-                        auto cap_result = client_->ReportSsdCapacity(
-                            config_.total_size_limit);
-                        if (!cap_result) {
-                            LOG(WARNING)
-                                << "ReportSsdCapacity failed during "
-                                << "heartbeat recovery: " << cap_result.error();
-                        }
-                    }
-                    heartbeat_result = fetch_offload_tasks();
-                    if (!heartbeat_result) {
-                        LOG(ERROR) << "Heartbeat failed after re-registration: "
-                                   << heartbeat_result.error();
-                        return heartbeat_result;
-                    }
-                    // Master lost all object metadata on restart.
-                    // Trigger async ScanMeta to re-register them,
-                    // same as what Init() does on startup.
-                    if (!rescan_future_.valid()) {
-                        LOG(INFO) << "Triggering background metadata rescan "
-                                  << "after LOCAL_DISK segment re-registration";
-                        metadata_resync_pending_.store(true);
-                        rescan_future_ =
-                            std::async(std::launch::async, [this]() {
-                                auto result = ReRegisterOffloadedObjects();
-                                if (!result) {
-                                    LOG(ERROR) << "Background metadata rescan "
-                                               << "failed: " << result.error();
-                                } else {
-                                    metadata_resync_pending_.store(false);
-                                }
-                            });
-                    }
-                } else {
-                    LOG(ERROR) << "Failed to re-register local disk segment: "
-                               << remount_result.error();
-                    return tl::make_unexpected(remount_result.error());
-                }
-            } else {
-                LOG(ERROR) << "Failed to send heartbeat with error: " << err;
-                return heartbeat_result;
+        if (!heartbeat_result &&
+            heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+            LOG(WARNING) << "Re-registering local disk segment after master recovery";
+            {
+                auto remount_fence = recovery->epoch->Advance();
+                auto mount_result = recovery->mount(enable_offloading_);
+                if (!mount_result) return mount_result;
+                // 必须先记录请求，再重试 fetch。即使 fetch 失败或已有旧
+                // future，新请求也会保留，旧扫描完成不能将它清掉。
+                recovery->RequestScan();
+                recovery->observed_epoch = recovery->epoch->Current();
+                LOG(INFO) << "[RECOVERY] local disk segment re-mounted, "
+                          << "generation=" << recovery->observed_epoch
+                          << " cancellations="
+                          << recovery->CancelledTasks();
             }
+            if (config_.total_size_limit > 0) {
+                auto cap_result = recovery->report(config_.total_size_limit);
+                if (!cap_result) {
+                    LOG(WARNING) << "ReportSsdCapacity during recovery failed: "
+                                 << cap_result.error();
+                }
+            }
+            start_rescan();
+            heartbeat_result = fetch_offload_tasks();
         }
+        if (!heartbeat_result) return heartbeat_result;
     }
 
     // === STEP 2: Poll whether master requested a full SSD clear ===
-    auto remove_all_result = client_->PollRemoveAll();
+    auto remove_all_result = recovery->poll_remove();
     if (remove_all_result && remove_all_result.value()) {
         RemoveAll();
     }
 
     // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
-    if (!offloading_objects.empty()) {
-        auto offload_result = OffloadObjects(offloading_objects);
+    // One tick must not hold the heartbeat for minutes -- it also has to Ping,
+    // service remounts and keep the recovery scan moving -- so the work is
+    // bounded by wall clock and the unattempted tail is carried to the next
+    // tick. Carried tasks come first so a steady arrival of new ones cannot
+    // starve them.
+    constexpr auto kMaxOffloadTickBudget = std::chrono::milliseconds(2000);
+    std::vector<OffloadTaskItem> work;
+    if (!carried_tasks_.empty()) {
+        if (carried_tasks_.front().epoch != task_epoch) {
+            // The generation moved on: a result for these would refer to the
+            // previous master's tasks, so drop them and let the new generation
+            // hand the work out again.
+            recovery->RecordCancelledTasks(carried_tasks_.size());
+            carried_tasks_.clear();
+            recovery->RequestScan();
+        } else {
+            work.reserve(carried_tasks_.size() + offloading_objects.size());
+            for (const auto& item : carried_tasks_) work.push_back(item.task);
+            carried_tasks_.clear();
+        }
+    }
+    work.insert(work.end(), offloading_objects.begin(), offloading_objects.end());
+    if (!work.empty()) {
+        std::vector<OffloadTaskItem> unprocessed;
+        auto offload_result = OffloadObjectsWithEpoch(
+            work, task_epoch, kMaxOffloadTickBudget, &unprocessed);
+        for (const auto& task : unprocessed)
+            carried_tasks_.push_back({task_epoch, task});
         if (!offload_result) {
             LOG(ERROR) << "Failed to persist objects with error: "
                        << offload_result.error();
             return offload_result;
+        }
+        if (!carried_tasks_.empty()) {
+            LOG(INFO) << "[OFFLOAD] carried " << carried_tasks_.size()
+                      << " task(s) to the next heartbeat tick, generation="
+                      << task_epoch;
         }
     }
 
@@ -1035,6 +1345,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
     std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     auto batched_query_results = client_->BatchQuery(keys, tenant_id);
+    const auto recovery = detail::GetFileStorageRecoveryState(this);
     if (batched_query_results.empty()) {
         return {};
     }
@@ -1043,6 +1354,9 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
             for (const auto& descriptor :
                  batched_query_results[i].value().replicas) {
                 if (client_->IsReplicaOnLocalMemory(descriptor)) {
+                    recovery->source_lease_deadline = std::min(
+                        recovery->source_lease_deadline,
+                        batched_query_results[i].value().lease_timeout);
                     const auto& memory_descriptor =
                         descriptor.get_memory_descriptor();
                     std::vector<Slice> slices;
@@ -1193,8 +1507,13 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
 }
 
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
+    const auto recovery = detail::GetFileStorageRecoveryState(this);
+    const auto scan_ticket = recovery->RequestedScan();
+    const auto scan_epoch = recovery->epoch->Current();
+    const auto scan_started = std::chrono::steady_clock::now();
     LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
-              << "offloaded objects with master";
+              << "offloaded objects with master, generation=" << scan_epoch
+              << " ticket=" << scan_ticket;
     int total_keys = 0;
     int total_batches = 0;
     int total_failures = 0;
@@ -1207,7 +1526,8 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                  "storage_backend_->ScanMeta()";
     auto scan_meta_result =
         storage_backend_->ScanMeta(
-            [this, &total_keys, &total_batches, &total_failures](
+            [this, recovery, scan_epoch, &total_keys, &total_batches,
+             &total_failures](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) {
                 // A rescan can be mid-flight when a drain deregisters the
@@ -1216,7 +1536,8 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 // registrations anyway (the segment entry is gone), so this
                 // stops the scan on the first batch instead of on a refused
                 // RPC.
-                if (draining_.load()) {
+                auto source_guard = recovery->epoch->Read();
+                if (draining_.load() || !source_guard.Matches(scan_epoch)) {
                     LOG(INFO) << "ReRegisterOffloadedObjects: aborting scan, "
                               << "the disk tier is draining";
                     return ErrorCode::SEGMENT_NOT_FOUND;
@@ -1228,7 +1549,7 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 }
                 auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
                 auto add_object_result =
-                    client_->NotifyOffloadSuccess(tasks, metadatas);
+                    recovery->notify(tasks, metadatas);
                 if (!add_object_result) {
                     total_failures++;
                     LOG(ERROR)
@@ -1261,6 +1582,25 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
               << "total_keys=" << total_keys
               << " total_batches=" << total_batches
               << " total_failures=" << total_failures;
+    auto source_guard = recovery->epoch->Read();
+    if (!source_guard.Matches(scan_epoch)) {
+        recovery->RequestScan();
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    // 只确认开始扫描时的票据；扫描期间新发起的请求不能被清掉。
+    recovery->CompleteScan(scan_ticket);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - scan_started)
+                                .count();
+    recovery->RecordRecovery(static_cast<uint64_t>(total_keys),
+                             static_cast<uint64_t>(elapsed_ms));
+    const auto snapshot = detail::TakeSnapshot(*recovery, *recovery->epoch);
+    LOG(INFO) << "ReRegisterOffloadedObjects: recovery complete, generation="
+              << snapshot.generation << " registered=" << total_keys
+              << " batches=" << total_batches << " failures=" << total_failures
+              << " elapsed_ms=" << elapsed_ms
+              << " recoveries=" << snapshot.recoveries
+              << " pending_scan=" << snapshot.pending_scan;
     return {};
 }
 

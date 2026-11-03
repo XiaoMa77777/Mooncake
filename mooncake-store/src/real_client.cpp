@@ -1358,6 +1358,13 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_dummy_client_monitor();
     stop_http_server();
 
+    // 心跳线程仍在从挂载段与客户端缓冲做暂存拷贝，而下面的清理会解除段映射、
+    // 释放客户端缓冲。先让 FileStorage 停下来并 join，否则暂存 memcpy 会读到
+    // 已解除映射的内存（观测到的段错误即在心跳线程的暂存拷贝处）。
+    if (file_storage_) {
+        file_storage_->Shutdown();
+    }
+
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};

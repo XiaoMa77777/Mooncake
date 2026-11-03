@@ -331,3 +331,8 @@ endforeach()
 
 add_store_test(read_plan_test read_plan_test.cpp)
 add_store_test(read_plan_pipeline_test read_plan_pipeline_test.cpp)
+
+if(WITH_KVCLIENT_BACKEND)
+  add_store_test(kvclient_backend_test kvclient_backend_test.cpp)
+  set_tests_properties(kvclient_backend_test PROPERTIES TIMEOUT 600 LABELS "kvclient")
+endif()
