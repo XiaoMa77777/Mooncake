@@ -196,6 +196,12 @@ class Client {
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
+
+    // True when the configured DFS object adapter accepts device Value ranges
+    // itself, so a full-object DFS read can be issued straight into the
+    // caller's device buffer instead of a HOST temporary. False for file mode,
+    // for HOST-only adapters and before the backend is attached.
+    bool DfsAcceptsDevicePointers() const;
     std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers);
 
@@ -896,6 +902,23 @@ class Client {
         const std::vector<std::string>& keys,
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors);
+
+    // True when any slice points into a registered device allocation.
+    static bool HasDeviceSlice(const std::vector<Slice>& slices);
+
+    // Strict device direct (DFS object adapter accepts device pointers) plus
+    // Mooncake's object checksum is refused: the checksum is CRC64-ECMA over the
+    // object bytes and is currently computed on the HOST, so enabling it would
+    // add a Value D2H copy to a path that claims none. The device-side algorithm
+    // (CRC16/T10-DIF) is a different checksum and cannot stand in for it. Refuse
+    // the combination rather than silently disabling verification.
+    bool RefusesDeviceChecksum(const std::vector<Slice>& slices) const;
+
+    // True when a slice is device memory (per the accelerator registry) that the
+    // DFS adapter has not registered. Such a range must be refused, not staged:
+    // the adapter cannot tell it apart from a HOST pointer, and copying into it
+    // as HOST would write through the wrong address space.
+    bool RefusesUnregisteredDeviceRange(const std::vector<Slice>& slices) const;
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
         std::vector<PutOperation>& ops, bool is_upsert);

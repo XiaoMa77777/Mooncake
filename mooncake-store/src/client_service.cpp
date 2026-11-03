@@ -1371,6 +1371,15 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    if (RefusesDeviceChecksum(slices)) {
+        LOG(ERROR) << "object_checksum_device_direct_unsupported key=" << object_key
+                   << " reason=verification_requires_host_copy";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (RefusesUnregisteredDeviceRange(slices)) {
+        LOG(ERROR) << "dfs_device_range_unregistered key=" << object_key;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -1437,6 +1446,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     return {};
+}
+
+bool Client::DfsAcceptsDevicePointers() const {
+    return dfs_storage_backend_ != nullptr &&
+           dfs_storage_backend_->AcceptsDevicePointers();
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
@@ -1707,6 +1721,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
                 continue;
             }
+            if (RefusesDeviceChecksum(slices_it->second)) {
+                // 校验读会对设备目标做 D2H；严格直通组合必须显式拒绝，不能
+                // 先写设备再偷偷拷贝回来核对。
+                LOG(ERROR) << "object_checksum_device_direct_unsupported key=" << key
+                           << " reason=verification_requires_host_copy";
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            if (RefusesUnregisteredDeviceRange(slices_it->second)) {
+                LOG(ERROR) << "dfs_device_range_unregistered key=" << key;
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
             const auto& desc = replica.get_dfs_descriptor();
             dfs_read_requests.push_back(
                 DfsReadRequest{key, desc, slices_it->second});
@@ -1872,6 +1899,11 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    if (RefusesDeviceChecksum(slices)) {
+        LOG(ERROR) << "object_checksum_device_direct_unsupported key=" << key
+                   << " reason=checksum_requires_host_copy";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2015,6 +2047,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
+    if (RefusesDeviceChecksum(slices)) {
+        LOG(ERROR) << "object_checksum_device_direct_unsupported key=" << key
+                   << " reason=checksum_requires_host_copy";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2332,6 +2369,14 @@ void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
         return;
     }
     for (auto& op : ops) {
+        if (RefusesDeviceChecksum(op.slices)) {
+            LOG(ERROR) << "object_checksum_device_direct_unsupported key="
+                       << op.key << " reason=checksum_requires_host_copy";
+            op.SetTerminalError(ErrorCode::INVALID_PARAMS,
+                                PutOperationState::MASTER_FAILED,
+                                "device direct with object checksum is unsupported");
+            continue;
+        }
         auto checksum_result = ComputeObjectChecksumForSlices(
             op.key, op.slices, CalculateSliceSize(op.slices));
         if (!checksum_result) {
@@ -2624,8 +2669,42 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
     }
 }
 
-std::vector<ErrorCode> Client::WriteDfsReplicas(
-    const std::vector<std::string>& keys,
+bool Client::HasDeviceSlice(const std::vector<Slice>& slices) {
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (const auto& slice : slices) {
+        if (slice.ptr != nullptr &&
+            runtime_accelerator.FindDeviceForPointer(slice.ptr) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Client::RefusesUnregisteredDeviceRange(
+    const std::vector<Slice>& slices) const {
+    if (!dfs_storage_backend_ || !dfs_storage_backend_->AcceptsDevicePointers()) {
+        return false;
+    }
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (const auto& slice : slices) {
+        if (slice.ptr != nullptr && slice.size != 0 &&
+            runtime_accelerator.FindDeviceForPointer(slice.ptr) != nullptr &&
+            !dfs_storage_backend_->AcceptsDeviceRange(slice.ptr, slice.size)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Client::RefusesDeviceChecksum(const std::vector<Slice>& slices) const {
+    return object_checksum_enabled_ && dfs_storage_backend_ != nullptr &&
+           dfs_storage_backend_->AcceptsDevicePointers() &&
+           HasDeviceSlice(slices);
+}
+
+std::vector<ErrorCode> Client::WriteDfsReplicas(    const std::vector<std::string>& keys,
     const std::vector<const std::vector<Slice>*>& slice_lists,
     const std::vector<DistributedFSDescriptor>& descriptors) {
     if (keys.size() != slice_lists.size() ||
@@ -2648,6 +2727,13 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     requests.reserve(keys.size());
     request_indices.reserve(keys.size());
 
+    // Capability, not permission: when the object adapter accepts device Value
+    // ranges it validates each request itself and refuses anything that is not a
+    // fully registered device allocation. Only then may this path skip its own
+    // device-to-HOST staging. A HOST-only adapter leaves this false and keeps the
+    // original staging behaviour unchanged.
+    const bool direct_device = dfs_storage_backend_->AcceptsDevicePointers();
+
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -2659,29 +2745,43 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
         std::vector<Slice> host_slices;
         host_slices.reserve(slice_lists[i]->size());
         bool staging_succeeded = true;
-        for (const auto& slice : *slice_lists[i]) {
-            device::PointerInfo info{};
-            auto* device = slice.ptr == nullptr
-                               ? nullptr
-                               : runtime_accelerator.FindDeviceForPointer(
-                                     slice.ptr, &info);
-            if (device == nullptr) {
-                host_slices.push_back(slice);
+        if (direct_device) {
+            // Pass the caller's ranges through untouched, but refuse device
+            // memory the adapter did not register: at the adapter it is
+            // indistinguishable from a HOST pointer, so handing it over would
+            // become a HOST copy through the wrong address space.
+            if (RefusesUnregisteredDeviceRange(*slice_lists[i])) {
+                LOG(ERROR) << "DFS device range is outside every registered arena"
+                           << " for key " << keys[i];
+                results[i] = ErrorCode::INVALID_PARAMS;
                 continue;
             }
+            host_slices.assign(slice_lists[i]->begin(), slice_lists[i]->end());
+        } else {
+            for (const auto& slice : *slice_lists[i]) {
+                device::PointerInfo info{};
+                auto* device = slice.ptr == nullptr
+                                   ? nullptr
+                                   : runtime_accelerator.FindDeviceForPointer(
+                                         slice.ptr, &info);
+                if (device == nullptr) {
+                    host_slices.push_back(slice);
+                    continue;
+                }
 
-            device->SetContext(info.device_id);
-            auto buffer = pinned_buffer_pool_->Acquire(slice.size);
-            if (!device->Copy(buffer.data, slice.ptr, slice.size,
-                              device::CopyDirection::kDeviceToHost)) {
-                LOG(ERROR) << "DFS D2H staging failed for key " << keys[i];
-                pinned_buffer_pool_->Release(std::move(buffer));
-                results[i] = ErrorCode::TRANSFER_FAIL;
-                staging_succeeded = false;
-                break;
+                device->SetContext(info.device_id);
+                auto buffer = pinned_buffer_pool_->Acquire(slice.size);
+                if (!device->Copy(buffer.data, slice.ptr, slice.size,
+                                  device::CopyDirection::kDeviceToHost)) {
+                    LOG(ERROR) << "DFS D2H staging failed for key " << keys[i];
+                    pinned_buffer_pool_->Release(std::move(buffer));
+                    results[i] = ErrorCode::TRANSFER_FAIL;
+                    staging_succeeded = false;
+                    break;
+                }
+                host_slices.emplace_back(Slice{buffer.data, slice.size});
+                staging_buffers.push_back(std::move(buffer));
             }
-            host_slices.emplace_back(Slice{buffer.data, slice.size});
-            staging_buffers.push_back(std::move(buffer));
         }
         if (!staging_succeeded) {
             continue;
@@ -3348,6 +3448,13 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (!result) {
         return tl::unexpected(result.error());
     }
+    // Physical reclamation is deliberately *not* wired here: doing it inside
+    // Remove() would change the public failure semantics (a Master-side
+    // OBJECT_NOT_FOUND on retry silently skipping the physical delete) and would
+    // have to run before the local hot-cache invalidation below. The object path
+    // exposes an explicit cleanup entry (DistributedStorageBackend::RemoveObject)
+    // that tests and maintenance call directly instead.
+
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }

@@ -46,10 +46,44 @@ bool DistributedStorageConfig::Validate() const {
             << fsdir;
         return false;
     }
-    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix") {
+    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix" &&
+        fs_adapter_type != "object_storage") {
         LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
                    << fs_adapter_type;
         return false;
+    }
+    if (fs_adapter_type == "object_storage") {
+        // Object mode has no shard file to size or align, so the filesystem
+        // checks below do not describe it. What it does need is its own identity
+        // and the SDK configuration its transport is built from -- without those
+        // there is no object namespace to address and no way to reach it.
+        if (object_cache_instance.empty()) {
+            LOG(ERROR) << "DistributedStorageConfig: object_storage requires "
+                          "object_cache_instance";
+            return false;
+        }
+        if (object_epoch == 0) {
+            LOG(ERROR) << "DistributedStorageConfig: object_storage requires a "
+                          "non-zero object_epoch";
+            return false;
+        }
+        if (object_layout_version != 1) {
+            LOG(ERROR) << "DistributedStorageConfig: unsupported "
+                          "object_layout_version: "
+                       << object_layout_version;
+            return false;
+        }
+        if (kvclient_sdk_config_path.empty()) {
+            LOG(ERROR) << "DistributedStorageConfig: object_storage requires "
+                          "kvclient_sdk_config_path";
+            return false;
+        }
+        if (!single_tenant) {
+            LOG(ERROR) << "DistributedStorageConfig: Currently, DFS requires "
+                          "single_tenant=true";
+            return false;
+        }
+        return true;
     }
     if (shard_count <= 0) {
         LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
@@ -76,6 +110,17 @@ bool DistributedStorageConfig::Validate() const {
 }
 
 bool DistributedStorageConfig::ValidateForAllocator() const {
+    // Checked before Validate(), so the refusal says what it means. The Master's
+    // allocator is a filesystem allocator; object mode is a *client*
+    // configuration. Accepting it here is what would let
+    // `DfsGlobalAllocator::Init` be handed a config it cannot build an adapter
+    // for -- and then dereference the null one. The deployment shape is
+    // therefore Master on hf3fs/posix, client on object_storage.
+    if (fs_adapter_type == "object_storage") {
+        LOG(ERROR) << "DistributedStorageConfig: object_storage is a client "
+                      "configuration; the Master allocator needs hf3fs or posix";
+        return false;
+    }
     if (!Validate()) return false;
 
     if (eviction_low_watermark < 0.0 || eviction_low_watermark > 1.0 ||
@@ -116,6 +161,25 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
                                               config.fs_adapter_type));
     config.enable_health_check =
         Environ::GetBool("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", false);
+    config.object_cache_instance = Environ::GetString(
+        "MOONCAKE_DFS_OBJECT_CACHE_INSTANCE", config.object_cache_instance);
+    config.object_epoch = Environ::GetUInt64("MOONCAKE_DFS_OBJECT_EPOCH",
+                                             config.object_epoch);
+    config.object_layout_version = static_cast<uint32_t>(Environ::GetUInt64(
+        "MOONCAKE_DFS_OBJECT_LAYOUT_VERSION", config.object_layout_version));
+    config.object_duplicate_window_keys = static_cast<size_t>(Environ::GetUInt64(
+        "MOONCAKE_DFS_OBJECT_DUPLICATE_WINDOW_KEYS",
+        config.object_duplicate_window_keys));
+    config.object_duplicate_admission = Environ::GetString(
+        "MOONCAKE_DFS_OBJECT_DUPLICATE_ADMISSION",
+        config.object_duplicate_admission);
+    config.object_scratch_budget_bytes = static_cast<size_t>(Environ::GetUInt64(
+        "MOONCAKE_DFS_OBJECT_SCRATCH_BUDGET_BYTES",
+        config.object_scratch_budget_bytes));
+    config.kvclient_sdk_config_path = Environ::GetString(
+        "MOONCAKE_DFS_KVCLIENT_SDK_CONFIG", config.kvclient_sdk_config_path);
+    config.kvclient_timeout_ms = static_cast<uint32_t>(Environ::GetUInt64(
+        "MOONCAKE_DFS_KVCLIENT_TIMEOUT_MS", config.kvclient_timeout_ms));
     config.shard_count =
         Environ::GetInt("MOONCAKE_DFS_SHARD_COUNT", config.shard_count);
     config.shard_capacity = Environ::GetUInt64("MOONCAKE_DFS_SHARD_CAPACITY",
@@ -187,6 +251,15 @@ DistributedStorageBackend::~DistributedStorageBackend() {
         }
     }
     if (fs_adapter_) fs_adapter_->Shutdown();
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::Close() {
+    if (object_storage_adapter_ == nullptr) {
+        // File mode keeps its shard descriptors until destruction; there is no
+        // "no DMA can still touch your buffer" claim to make here.
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    return object_storage_adapter_->Close();
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
@@ -313,9 +386,7 @@ DistributedStorageBackend::BatchWrite(
     results.reserve(requests.size());
 
     if (UsesObjectStorage()) {
-        results.assign(requests.size(),
-                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
-        return results;
+        return ObjectBatchWrite(requests);
     }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
@@ -402,15 +473,187 @@ DistributedStorageBackend::BatchWrite(
     return results;
 }
 
+tl::expected<void, ErrorCode> DistributedStorageBackend::RemoveObject(
+    const std::string& logical_key) {
+    if (!initialized_ || object_storage_adapter_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    return object_storage_adapter_->Delete(logical_key);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::ObjectBatchWrite(
+    const std::vector<DfsWriteRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results(requests.size());
+    if (!initialized_ || object_storage_adapter_ == nullptr) {
+        for (auto& result : results) {
+            result = tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+        return results;
+    }
+
+    // A write batch that names the same key twice is refused *at every position
+    // that names it*, not just at the later one. Submitting both would leave the
+    // outcome to the adapter -- which may well accept both, keep whichever it
+    // wrote last, and report success twice for one object, which is not the same
+    // answer as either write.
+    std::unordered_map<std::string, int> key_counts;
+    key_counts.reserve(requests.size() * 2);
+    for (const auto& request : requests) {
+        ++key_counts[request.key];
+    }
+
+    // Positions, not keys: the surviving requests are mapped back by index, so
+    // several distinct requests stay distinct all the way down.
+    std::vector<ObjectPutRequest> batch;
+    std::vector<std::size_t> position;
+    batch.reserve(requests.size());
+    position.reserve(requests.size());
+
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        if (key_counts[request.key] > 1) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        const std::uint64_t expected = request.descriptor.object_size;
+        std::vector<iovec> iovs;
+        iovs.reserve(request.slices.size());
+        std::size_t total = 0;
+        bool usable = expected != 0;
+        for (const auto& slice : request.slices) {
+            if (slice.size == 0) {
+                continue;  // an empty region contributes nothing and must not fail
+            }
+            if (slice.ptr == nullptr ||
+                slice.size > std::numeric_limits<std::size_t>::max() - total) {
+                usable = false;
+                break;
+            }
+            total += slice.size;
+            iovec iov{const_cast<void*>(slice.ptr), slice.size};
+            iovs.push_back(iov);
+        }
+        // The regions must describe exactly the object. Anything else is refused
+        // before any I/O, and the refusal stays with this item.
+        if (!usable || total != expected) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        batch.push_back(ObjectPutRequest{request.key, std::move(iovs)});
+        position.push_back(i);
+    }
+
+    if (!batch.empty()) {
+        auto batch_results = object_storage_adapter_->PutVBatch(batch);
+        if (batch_results.size() != batch.size()) {
+            // A result count that does not match its input cannot be indexed
+            // safely; fail the whole submission rather than read past the end.
+            LOG(ERROR) << "object adapter returned " << batch_results.size()
+                       << " results for " << batch.size() << " writes";
+            for (std::size_t n = 0; n < batch.size(); ++n) {
+                results[position[n]] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            return results;
+        }
+        for (std::size_t n = 0; n < batch.size(); ++n) {
+            results[position[n]] = batch_results[n];
+        }
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::ObjectBatchRead(
+    const std::vector<DfsReadRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results(requests.size());
+    if (!initialized_ || object_storage_adapter_ == nullptr) {
+        for (auto& result : results) {
+            result = tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+        return results;
+    }
+
+    std::vector<ObjectGetRequest> batch;
+    std::vector<std::size_t> position;
+    batch.reserve(requests.size());
+    position.reserve(requests.size());
+
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        const std::uint64_t expected = request.descriptor.object_size;
+        std::vector<iovec> iovs;
+        iovs.reserve(request.slices.size());
+        std::size_t remaining = static_cast<std::size_t>(expected);
+        bool usable = expected != 0 && expected <= std::numeric_limits<std::size_t>::max();
+        if (usable) {
+            for (const auto& slice : request.slices) {
+                if (remaining == 0) {
+                    break;
+                }
+                if (slice.size == 0) {
+                    continue;
+                }
+                if (slice.ptr == nullptr) {
+                    usable = false;
+                    break;
+                }
+                // The caller may offer more capacity than the object needs -- a
+                // tail guard. That is legal and must not become a rejection, so
+                // the regions are clipped to exactly `object_size`; the guard is
+                // left untouched.
+                const std::size_t take =
+                    std::min<std::size_t>(slice.size, remaining);
+                iovec iov{slice.ptr, take};
+                iovs.push_back(iov);
+                remaining -= take;
+            }
+        }
+        // Insufficient capacity is a refusal, not a short read: the object does
+        // not fit, and pretending otherwise would deliver part of it.
+        if (!usable || remaining != 0) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        batch.push_back(ObjectGetRequest{request.key, std::move(iovs),
+                                         static_cast<std::size_t>(expected)});
+        position.push_back(i);
+    }
+
+    if (!batch.empty()) {
+        auto batch_results = object_storage_adapter_->GetBatch(batch);
+        if (batch_results.size() != batch.size()) {
+            LOG(ERROR) << "object adapter returned " << batch_results.size()
+                       << " results for " << batch.size() << " reads";
+            for (std::size_t n = 0; n < batch.size(); ++n) {
+                results[position[n]] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            return results;
+        }
+        for (std::size_t n = 0; n < batch.size(); ++n) {
+            const std::size_t index = position[n];
+            if (!batch_results[n]) {
+                results[index] = tl::make_unexpected(batch_results[n].error());
+                continue;
+            }
+            // The reported length must be the object's real length. A provider
+            // that echoed the caller's capacity would pass this only by accident.
+            if (*batch_results[n] !=
+                static_cast<std::size_t>(requests[index].descriptor.object_size)) {
+                results[index] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+    }
+    return results;
+}
+
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     const std::vector<DfsReadRequest>& requests) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(requests.size());
 
     if (UsesObjectStorage()) {
-        results.assign(requests.size(),
-                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
-        return results;
+        return ObjectBatchRead(requests);
     }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";

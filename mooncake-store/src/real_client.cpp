@@ -3526,6 +3526,32 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
+        if (replica.is_dfs_replica() && client_->DfsAcceptsDevicePointers()) {
+            // DFS + device destination: the object adapter writes the Value
+            // straight into the caller's registered device range, so a HOST
+            // temporary plus H2D scatter would be pure overhead. Only taken when
+            // the adapter declares device support; Client::Get itself refuses
+            // this when object checksums are enabled, because verifying would
+            // require reading the Value back to the HOST.
+            void* dst = static_cast<char*>(buffer) + dst_offset;
+            auto runtime_accelerator =
+                device::GetAcceleratorRegistry().RuntimeAccelerators();
+            if (runtime_accelerator.FindDeviceForPointer(dst) != nullptr) {
+                std::vector<mooncake::Slice> slices;
+                allocateSlices(slices, replica, dst);
+                auto filtered_qr =
+                    FilterQueryResult(query_result, replica, verify_checksum);
+                auto get_result = client_->Get(key, filtered_qr, slices);
+                if (!get_result) {
+                    LOG(ERROR) << "DFS device Get failed for key: " << key
+                               << " with error: "
+                               << toString(get_result.error());
+                    return tl::unexpected(get_result.error());
+                }
+                return static_cast<int64_t>(total_size);
+            }
+        }
+
         if (replica.is_disk_replica() || replica.is_dfs_replica()) {
             // File-backed full read: use a contiguous temp buffer, then
             // scatter to the requested destination.
@@ -5157,6 +5183,25 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                              .query_result = std::move(query_result_values),
                              .slices = std::move(key_slices),
                              .total_size = total_size});
+            results[i] = static_cast<int64_t>(total_size);
+            continue;
+        }
+        if (replica.is_dfs_replica() && client_->DfsAcceptsDevicePointers() &&
+            device::GetAcceleratorRegistry()
+                    .RuntimeAccelerators()
+                    .FindDeviceForPointer(buffers[i]) != nullptr) {
+            // DFS into a caller-owned device buffer: BatchGet/BatchRead writes
+            // the Value through the object adapter directly. Object checksums,
+            // when enabled, make Client::BatchGet refuse the item rather than
+            // verify over an H2D copy.
+            std::vector<Slice> key_slices;
+            allocateSlices(key_slices, replica, buffers[i]);
+            valid_operations.push_back(
+                {.key = key,
+                 .original_index = i,
+                 .query_result = FilterQueryResult(query_result_values, replica),
+                 .slices = std::move(key_slices),
+                 .total_size = total_size});
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }

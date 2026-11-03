@@ -336,3 +336,57 @@ if(WITH_KVCLIENT_BACKEND)
   add_store_test(kvclient_backend_test kvclient_backend_test.cpp)
   set_tests_properties(kvclient_backend_test PROPERTIES TIMEOUT 600 LABELS "kvclient")
 endif()
+
+if(WITH_KVCLIENT_OBJECT_ADAPTER)
+  # Imported targets are directory-scoped: the find_package() in mooncake-store/src
+  # does not reach this directory, so the alias is resolved here too.
+  find_package(kvclient CONFIG REQUIRED)
+  # The object-mode factory test is compiled only when there is glue to link,
+  # and it needs both the define (to compile the case) and the target (to resolve
+  # the adapter's symbols).
+  target_compile_definitions(dfs_sync_client_test PRIVATE MOONCAKE_WITH_KVCLIENT_OBJECT)
+  target_link_libraries(dfs_sync_client_test PRIVATE kvclient::mooncake_object_adapter)
+endif()
+# Native device-direct runner for the 2026-10-19 plan. The source lives in the
+# kvclient workspace; the target is built here because it needs both the real
+# Mooncake client stack and kvclient's object adapter.
+set(KVCLIENT_TEST_SOURCE_DIR "" CACHE PATH
+    "kvclient tests directory used by integration runners")
+if(WITH_KVCLIENT_OBJECT_ADAPTER AND KVCLIENT_TEST_SOURCE_DIR)
+  find_package(kvclient CONFIG REQUIRED)
+  add_executable(device_stack_bench
+    "${KVCLIENT_TEST_SOURCE_DIR}/mooncake/device_stack_bench.cpp")
+  target_compile_features(device_stack_bench PRIVATE cxx_std_20)
+  target_include_directories(device_stack_bench SYSTEM PRIVATE
+    "${KVCLIENT_TEST_SOURCE_DIR}/mooncake")
+  target_link_libraries(device_stack_bench PRIVATE
+    mooncake_store transfer_engine cachelib_memory_allocator glog::glog
+    ibverbs kvclient::mooncake_object_adapter pthread)
+  if(USE_HYGON)
+    target_compile_definitions(device_stack_bench PRIVATE
+      KVCLIENT_MOONCAKE_HYGON=1 __HIP_PLATFORM_AMD__=1)
+    target_include_directories(device_stack_bench SYSTEM PRIVATE
+      "${DTK_INCLUDE_DIR}")
+    target_link_libraries(device_stack_bench PRIVATE kvclient::hygon)
+    find_program(KVCLIENT_DEVICE_KERNEL_HIPCC hipcc HINTS "${DTK_ROOT}/bin")
+    if(NOT KVCLIENT_DEVICE_KERNEL_HIPCC)
+      message(FATAL_ERROR
+        "device_stack_bench needs hipcc to build the device consumption kernel")
+    endif()
+    set(_kvclient_device_kernel
+        "${CMAKE_CURRENT_BINARY_DIR}/device_dcu_value_kernel.o")
+    add_custom_command(OUTPUT "${_kvclient_device_kernel}"
+      COMMAND "${KVCLIENT_DEVICE_KERNEL_HIPCC}" -std=c++17 -fPIC -O2
+        -I "${KVCLIENT_TEST_SOURCE_DIR}/mooncake" -I "${DTK_INCLUDE_DIR}"
+        -c "${KVCLIENT_TEST_SOURCE_DIR}/mooncake/dcu_value_kernel.hip"
+        -o "${_kvclient_device_kernel}"
+      DEPENDS "${KVCLIENT_TEST_SOURCE_DIR}/mooncake/dcu_value_kernel.hip"
+              "${KVCLIENT_TEST_SOURCE_DIR}/mooncake/dcu_value_kernel.h"
+      VERBATIM)
+    set_source_files_properties("${_kvclient_device_kernel}" PROPERTIES
+      GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    add_library(device_stack_kernel STATIC "${_kvclient_device_kernel}")
+    set_target_properties(device_stack_kernel PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_libraries(device_stack_bench PRIVATE device_stack_kernel)
+  endif()
+endif()

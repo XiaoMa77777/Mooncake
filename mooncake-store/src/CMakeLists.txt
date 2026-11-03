@@ -449,6 +449,31 @@ if(WITH_KVCLIENT_BACKEND)
                         PRIVATE kvclient::mooncake)
 endif()
 
+# DFS object mode's client glue. Deliberately a separate switch from
+# WITH_KVCLIENT_BACKEND: that one adds the offload backend, this one adds the
+# object-storage adapter the DFS object path needs, and a deployment may want
+# either without the other. Both stay OFF by default so a plain build keeps no
+# kvclient dependency at all.
+option(WITH_KVCLIENT_OBJECT_ADAPTER
+       "build the kvclient DFS object adapter glue (needs kvclient with KVCLIENT_ENABLE_MOONCAKE_OBJECT_ADAPTER)"
+       OFF)
+if(WITH_KVCLIENT_OBJECT_ADAPTER)
+  find_package(kvclient CONFIG REQUIRED)
+  # Refuse at configure time rather than link-fail later: the exported alias only
+  # exists when kvclient was itself built with its object adapter enabled.
+  if(NOT TARGET kvclient::mooncake_object_adapter)
+    message(FATAL_ERROR
+      "WITH_KVCLIENT_OBJECT_ADAPTER requires kvclient built with "
+      "KVCLIENT_ENABLE_MOONCAKE_OBJECT_ADAPTER=ON; "
+      "kvclient::mooncake_object_adapter is not exported by the package at "
+      "${kvclient_DIR}")
+  endif()
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_WITH_KVCLIENT_OBJECT)
+  target_link_libraries(mooncake_store_client_objects
+                        PRIVATE kvclient::mooncake_object_adapter)
+endif()
+
 # Reduced Store library linked by mooncake_master.
 add_library(
   mooncake_store_master STATIC $<TARGET_OBJECTS:mooncake_store_shared_objects>
@@ -498,6 +523,15 @@ if(WITH_KVCLIENT_BACKEND)
 endif()
 
 
+if(WITH_KVCLIENT_OBJECT_ADAPTER)
+  # The object files are linked in through $<TARGET_OBJECTS:...>, and a PRIVATE
+  # link on the OBJECT library does not travel that path. Without this the final
+  # consumer would fail to resolve the glue's symbols at link time -- which is
+  # the failure this branch exists to make impossible, so it is spelled out
+  # rather than assumed.
+  target_compile_definitions(mooncake_store PUBLIC MOONCAKE_WITH_KVCLIENT_OBJECT)
+  target_link_libraries(mooncake_store PRIVATE kvclient::mooncake_object_adapter)
+endif()
 target_link_libraries(
   mooncake_store
   PUBLIC mooncake_local_ssd

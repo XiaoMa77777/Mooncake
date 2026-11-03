@@ -59,6 +59,16 @@ struct FdGuard {
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
 
+#ifdef MOONCAKE_WITH_KVCLIENT_OBJECT
+// The DFS object glue. Guarded so a default build never sees a kvclient header
+// at all. Deliberately a sibling of USE_3FS rather than nested inside it: the two
+// answer unrelated questions, and the common pairing is USE_3FS=OFF with the
+// object adapter ON.
+#include <kvclient/mooncake/device_arena.hpp>
+#include <kvclient/mooncake/object_adapter.hpp>
+#include <kvclient/mooncake/transport.hpp>
+#endif
+
 namespace mooncake {
 
 namespace {
@@ -5778,6 +5788,69 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
 
 //-----------------------------------------------------------------------------
 
+#ifdef MOONCAKE_WITH_KVCLIENT_OBJECT
+namespace {
+
+// Builds the kvclient object adapter from the client-side object configuration.
+//
+// The SDK config path is deliberately not part of the glue: the adapter takes a
+// transport, and building that transport from a config file is the factory's job
+// -- which is here.
+tl::expected<std::unique_ptr<ObjectStorageAdapter>, ErrorCode>
+MakeKvclientObjectAdapter(const DistributedStorageConfig& config) {
+    aistor::SdkTransportOptions transport_options;
+    transport_options.sdkConfigPath = config.kvclient_sdk_config_path;
+    transport_options.timeoutMs = config.kvclient_timeout_ms;
+    // The batch I/O entry points this factory exists to serve read
+    // `requestTimeoutMs`, not `timeoutMs`. Setting only the latter would leave
+    // the main path on the SDK default and quietly ignore the operator's value.
+    // `closeTimeoutMs` is a different obligation (an Exit wait, not a DMA safety
+    // deadline) and is deliberately left alone.
+    transport_options.requestTimeoutMs = config.kvclient_timeout_ms;
+    // Device arenas are owned by the embedding application and published through
+    // kvclient's public registry before the storage backend is built. An empty
+    // snapshot leaves the transport HOST-only, which makes the adapter's device
+    // capability bit false and refuses device ranges instead of staging them.
+    for (auto& entry : aistor::SnapshotObjectAdapterDeviceArenas()) {
+        if (transport_options.probeScratch.address == nullptr &&
+            entry.probeScratch.address != nullptr) {
+            transport_options.probeScratch = entry.probeScratch;
+        }
+        transport_options.deviceArenas.push_back(std::move(entry.arena));
+    }
+    auto transport = std::make_shared<aistor::SdkTransport>(transport_options);
+
+    aistor::ObjectKeyOptions key_options;
+    key_options.cacheInstance = config.object_cache_instance;
+    key_options.epoch = config.object_epoch;
+    key_options.layoutVersion = config.object_layout_version;
+
+    aistor::ObjectStoreOptions store_options;
+    store_options.duplicateWindowKeys = config.object_duplicate_window_keys;
+    store_options.scratchBudgetBytes = config.object_scratch_budget_bytes;
+    // Mapped explicitly, and an unknown value is refused: defaulting it would
+    // silently choose an admission policy the operator did not ask for.
+    if (config.object_duplicate_admission == "off") {
+        store_options.admission = aistor::DuplicateAdmission::kOff;
+    } else if (config.object_duplicate_admission == "diagnostic") {
+        store_options.admission = aistor::DuplicateAdmission::kDiagnostic;
+    } else if (config.object_duplicate_admission == "strict") {
+        store_options.admission = aistor::DuplicateAdmission::kStrict;
+    } else {
+        LOG(ERROR) << "DistributedStorageConfig: unknown "
+                      "object_duplicate_admission: "
+                   << config.object_duplicate_admission;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return std::unique_ptr<ObjectStorageAdapter>(
+        std::make_unique<aistor::KvclientObjectAdapter>(
+            key_options, std::move(transport), store_options));
+}
+
+}  // namespace
+#endif  // MOONCAKE_WITH_KVCLIENT_OBJECT
+
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config) {
     switch (config.storage_backend_type) {
@@ -5837,6 +5910,30 @@ CreateStorageBackend(const FileStorageConfig& config) {
             if (!distributed_config.Validate()) {
                 throw std::invalid_argument(
                     "Invalid DistributedStorage configuration");
+            }
+            if (distributed_config.fs_adapter_type == "object_storage") {
+                // Object mode needs the kvclient glue. A build without it must
+                // refuse here rather than fall through to a filesystem adapter:
+                // the two serve different namespaces, and silently picking the
+                // filesystem one would write the object's bytes somewhere the
+                // object reader never looks.
+#ifdef MOONCAKE_WITH_KVCLIENT_OBJECT
+                auto object_adapter =
+                    MakeKvclientObjectAdapter(distributed_config);
+                if (!object_adapter) {
+                    LOG(ERROR) << "object_storage adapter construction failed";
+                    return tl::make_unexpected(object_adapter.error());
+                }
+                return std::make_shared<DistributedStorageBackend>(
+                    config, distributed_config, nullptr,
+                    std::move(*object_adapter));
+#else
+                LOG(ERROR)
+                    << "DistributedStorageConfig selects object_storage but this "
+                       "build has no kvclient object adapter (rebuild with "
+                       "WITH_KVCLIENT_OBJECT_ADAPTER)";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
             }
             std::unique_ptr<FileSystemAdapter> adapter;
             if (distributed_config.fs_adapter_type == "posix") {

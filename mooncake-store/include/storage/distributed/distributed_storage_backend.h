@@ -35,6 +35,26 @@ struct DistributedStorageConfig {
     std::chrono::seconds deferred_free_duration{30};
     std::chrono::seconds eviction_check_interval{5};
 
+    // Object-storage mode (`fs_adapter_type == "object_storage"`). These are
+    // *client* settings: the Master's allocator stays a filesystem allocator, so
+    // a deployment runs the Master on hf3fs/posix and the client on
+    // object_storage. `ValidateForAllocator` refuses this mode outright for that
+    // reason -- see its comment.
+    //
+    // `object_cache_instance` and `object_epoch` are supplied by deployment
+    // orchestration, not generated per process: every client of one instance must
+    // agree on the epoch, and a Master restart requires stopping the old clients
+    // and switching the whole instance to a new epoch before restarting.
+    std::string object_cache_instance;
+    uint64_t object_epoch = 0;
+    uint32_t object_layout_version = 1;
+    size_t object_duplicate_window_keys = 1u << 16;
+    // "off" | "diagnostic" | "strict"; mapped to the core's enum by the factory.
+    std::string object_duplicate_admission = "diagnostic";
+    size_t object_scratch_budget_bytes = 64ULL * 1024ULL * 1024ULL;
+    std::string kvclient_sdk_config_path;
+    uint32_t kvclient_timeout_ms = 5000;
+
     bool Validate() const;
     bool ValidateForAllocator() const;
     static DistributedStorageConfig FromEnvironment();
@@ -81,6 +101,30 @@ class DistributedStorageBackend : public StorageBackendInterface {
         return storage_mode_ == DistributedStorageMode::kObjectStorage;
     }
 
+    // Object mode only: does the configured adapter accept device Value ranges
+    // without an HOST staging copy? False for file mode and for any adapter that
+    // leaves the default capability bit alone. A true answer only means the write
+    // path may skip its own staging; the adapter still validates each request and
+    // refuses an unregistered range instead of staging it.
+    bool AcceptsDevicePointers() const {
+        return object_storage_adapter_ != nullptr &&
+               object_storage_adapter_->AcceptsDevicePointers();
+    }
+
+    // Is this exact range carried by the adapter as device Value? See
+    // ObjectStorageAdapter::AcceptsDeviceRange.
+    bool AcceptsDeviceRange(const void* address, std::size_t length) const {
+        return object_storage_adapter_ != nullptr &&
+               object_storage_adapter_->AcceptsDeviceRange(address, length);
+    }
+
+    // Object mode only: drive the adapter's shutdown to a terminal state. This
+    // is what lets an embedder release application device memory: a successful
+    // Close means no in-flight DMA can still reference an arena. A retryable
+    // error keeps every resource alive and must be retried. File mode has no
+    // per-object close contract and reports NOT_SUPPORTED rather than pretending.
+    tl::expected<void, ErrorCode> Close();
+
     tl::expected<void, ErrorCode> Init() override;
 
     tl::expected<int64_t, ErrorCode> BatchOffload(
@@ -95,6 +139,33 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
+
+    // Object mode only: explicit physical cleanup entry. Callers that know a
+    // key's metadata is gone (tests, maintenance tooling) use this to drop the
+    // object from the object store as well.
+    //
+    // It is deliberately NOT called by Client::Remove/BatchRemove: doing the
+    // physical delete inside those would change their public failure semantics
+    // -- a retried removal would see the Master answer OBJECT_NOT_FOUND and skip
+    // the physical half, and the delete would have to run before the local
+    // hot-cache invalidation. File mode has no per-key physical object (the data
+    // lives inside shard files) and reports NOT_SUPPORTED rather than pretending
+    // to have deleted anything.
+    tl::expected<void, ErrorCode> RemoveObject(const std::string& logical_key);
+
+   private:
+    // Object-storage branches of the two DFS batch entry points.
+    //
+    // Both keep the caller's positions rather than keying by name: a write batch
+    // may legitimately name the same key twice, and a read batch may read one key
+    // into two different destinations, so collapsing by key would merge requests
+    // that are not the same request.
+    std::vector<tl::expected<void, ErrorCode>> ObjectBatchWrite(
+        const std::vector<DfsWriteRequest>& requests);
+    std::vector<tl::expected<void, ErrorCode>> ObjectBatchRead(
+        const std::vector<DfsReadRequest>& requests);
+
+   public:
 
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.
